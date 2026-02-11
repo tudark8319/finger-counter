@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Multi-Hand Finger Counter - HTML5</title>
+
+  <!-- MediaPipe Hands (multi-hand) via CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <style>
+    body { margin:0; background:#0b0b0f; color:#fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    .wrap { max-width: 1120px; margin: 0 auto; padding: 18px; }
+    h1 { font-size: 16px; margin: 0 0 10px; opacity: .92; }
+    .row { display:grid; grid-template-columns: 1fr; gap: 14px; align-items: start; }
+    @media (min-width: 1000px){ .row{ grid-template-columns: 1fr 360px; } }
+
+    .stage { position:relative; width: 100%; max-width: 860px; aspect-ratio: 4/3; margin: 0 auto; border-radius: 18px; overflow:hidden; border:1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.04); }
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; }
+
+    .panel { border-radius: 18px; border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.04); padding: 14px; }
+    .btns { display:flex; gap:10px; flex-wrap: wrap; }
+    button { padding: 10px 16px; font-weight: 800; border: 0; border-radius: 14px; cursor: pointer; }
+    .primary { background:#fff; color:#000; }
+    .danger { background:#ff4d4d; color:#000; }
+    .ghost { background: rgba(255,255,255,.10); color:#fff; border:1px solid rgba(255,255,255,.14); }
+
+    /* FIX: text was ridiculously huge */
+    .headline { font-size: 22px; font-weight: 950; line-height: 1.15; margin: 12px 0 6px; letter-spacing: -0.02em; }
+    .muted { color: rgba(255,255,255,.70); font-size: 13px; line-height: 1.35; }
+    .kv { display:flex; align-items:center; justify-content:space-between; gap:10px; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,.08); }
+    .kv:last-child{ border-bottom:0; }
+    .pill { font-size: 12px; padding: 5px 10px; border-radius: 999px; background: rgba(255,255,255,.10); border: 1px solid rgba(255,255,255,.12); }
+    .small { font-size: 12px; color: rgba(255,255,255,.65); }
+    .list { margin-top: 10px; display:flex; flex-direction:column; gap:8px; }
+    .chip { font-size: 12px; padding: 7px 10px; border-radius: 14px; background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.10); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>🖐 Multi-Hand Finger Counter (HTML5) — PREVIEW → bagă 2-3 mâini în cadru</h1>
+
+    <div class="row">
+      <div class="stage">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="canvas"></canvas>
+      </div>
+
+      <div class="panel">
+        <div class="btns">
+          <button id="btnStart" class="primary">PREVIEW</button>
+          <button id="btnStop"  class="danger" disabled>STOP</button>
+          <button id="btnFlip"  class="ghost" disabled>FLIP</button>
+        </div>
+
+        <div class="headline" id="headline">—</div>
+        <div class="muted" id="status">Status: idle</div>
+
+        <div style="height:10px"></div>
+        <div class="kv"><div class="muted">Max hands</div><div class="pill" id="maxHands">4</div></div>
+        <div class="kv"><div class="muted">Hands in frame</div><div class="pill" id="handsInFrame">0</div></div>
+        <div class="kv"><div class="muted">Total fingers up</div><div class="pill" id="totalFingers">0</div></div>
+        <div class="kv"><div class="muted">FPS</div><div class="pill" id="fps">0</div></div>
+
+        <div class="list" id="perHand"></div>
+
+        <div style="height:12px"></div>
+        <div class="muted">
+          Am reparat numărătoarea: acum folosește <b>unghiuri la articulații</b> (mult mai stabil decât „tip mai sus ca PIP”).
+        </div>
+        <div class="small" style="margin-top:8px">Tip: ține palmele spre cameră și nu le suprapune.</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+
+  const btnStart = document.getElementById('btnStart');
+  const btnStop  = document.getElementById('btnStop');
+  const btnFlip  = document.getElementById('btnFlip');
+
+  const elHeadline = document.getElementById('headline');
+  const elStatus   = document.getElementById('status');
+  const elMaxHands = document.getElementById('maxHands');
+  const elHands    = document.getElementById('handsInFrame');
+  const elTotal    = document.getElementById('totalFingers');
+  const elFps      = document.getElementById('fps');
+  const elPerHand  = document.getElementById('perHand');
+
+  let running = false;
+  let flip = false;
+  let camera = null;
+  let hands = null;
+
+  // smoothing (avoid flicker)
+  let lastTotals = [];
+  const SMOOTH_N = 6;
+
+  // per-hand smoothing by index (0..maxHands-1)
+  const perHandHistory = Array.from({length: 6}, () => []);
+
+  // fps
+  let lastT = 0;
+  let fpsEMA = 0;
+
+  const MAX_HANDS = 4;
+  elMaxHands.textContent = String(MAX_HANDS);
+
+  function setStatus(s){ elStatus.textContent = 'Status: ' + s; }
+
+  function median(arr){
+    if (!arr.length) return 0;
+    const a = arr.slice().sort((x,y)=>x-y);
+    const mid = Math.floor(a.length/2);
+    return a.length % 2 ? a[mid] : Math.round((a[mid-1]+a[mid])/2);
+  }
+
+  function smoothTotal(v){
+    lastTotals.push(v);
+    if (lastTotals.length > SMOOTH_N) lastTotals.shift();
+    return median(lastTotals);
+  }
+
+  function smoothHand(idx, v){
+    const h = perHandHistory[idx] || (perHandHistory[idx] = []);
+    h.push(v);
+    if (h.length > SMOOTH_N) h.shift();
+    return median(h);
+  }
+
+  function resizeCanvas(){
+    const w = video.videoWidth || 640;
+    const h = video.videoHeight || 480;
+    canvas.width = w;
+    canvas.height = h;
+  }
+
+  // --------- Better finger counting (angle-based) ---------
+  // Landmarks are normalized {x,y,z}. We only need x,y.
+  function angleDeg(a, b, c) {
+    // angle at b formed by a-b-c
+    const abx = a.x - b.x, aby = a.y - b.y;
+    const cbx = c.x - b.x, cby = c.y - b.y;
+    const dot = abx*cbx + aby*cby;
+    const ab = Math.hypot(abx, aby);
+    const cb = Math.hypot(cbx, cby);
+    if (ab === 0 || cb === 0) return 0;
+    let cos = dot / (ab * cb);
+    cos = Math.max(-1, Math.min(1, cos));
+    return Math.acos(cos) * 180 / Math.PI;
+  }
+
+  function fingerExtendedByAngle(lm, mcp, pip, tip) {
+    // If finger is straight, angle at PIP (mcp-pip-tip) is close to 180.
+    const ang = angleDeg(lm[mcp], lm[pip], lm[tip]);
+    return ang > 160; // threshold
+  }
+
+  function thumbExtendedByAngle(lm) {
+    // Thumb is special: use angle at MCP (1-2-4) or (2-3-4). We'll mix for stability.
+    const a1 = angleDeg(lm[1], lm[2], lm[4]);
+    const a2 = angleDeg(lm[2], lm[3], lm[4]);
+    // Extended thumb tends to have large angles.
+    return (a1 > 150) && (a2 > 150);
+  }
+
+  function countFingersOneHand(lm){
+    let c = 0;
+    if (thumbExtendedByAngle(lm)) c++;
+
+    // index, middle, ring, pinky
+    if (fingerExtendedByAngle(lm, 5, 6, 8)) c++;
+    if (fingerExtendedByAngle(lm, 9,10,12)) c++;
+    if (fingerExtendedByAngle(lm,13,14,16)) c++;
+    if (fingerExtendedByAngle(lm,17,18,20)) c++;
+
+    // Guard: if hand is clenched, angles can still look straight sometimes; add a sanity check using tip distance from wrist.
+    // A finger that is extended should have tip further from wrist than its pip.
+    const wrist = lm[0];
+    const pairs = [ [8,6], [12,10], [16,14], [20,18] ];
+    let sane = 0;
+    for (const [tip, pip] of pairs){
+      const dt = Math.hypot(lm[tip].x - wrist.x, lm[tip].y - wrist.y);
+      const dp = Math.hypot(lm[pip].x - wrist.x, lm[pip].y - wrist.y);
+      if (dt > dp) sane++;
+    }
+    // If sanity says none extended, zero them (except thumb) to avoid random counts.
+    if (sane === 0) {
+      c = thumbExtendedByAngle(lm) ? 1 : 0;
+    }
+
+    return c;
+  }
+
+  function drawVideoBase(){
+    if (flip) {
+      ctx.save();
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      ctx.restore();
+    } else {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    }
+  }
+
+  function drawBanner(text){
+    ctx.save();
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    const pad = 14;
+    const w = Math.min(canvas.width - pad*2, 860);
+    ctx.fillRect(pad, pad, w, 60);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = '800 18px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, pad + 12, pad + 30);
+    ctx.restore();
+  }
+
+  function setPerHand(items){
+    elPerHand.innerHTML = '';
+    items.forEach(it => {
+      const div = document.createElement('div');
+      div.className = 'chip';
+      div.textContent = `Mâna ${it.i+1} (${it.handLabel}): ${it.fingers} degete`;
+      elPerHand.appendChild(div);
+    });
+  }
+
+  async function start(){
+    if (running) return;
+    setStatus('starting…');
+
+    hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+      maxNumHands: MAX_HANDS,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.75,
+      minTrackingConfidence: 0.75,
+    });
+
+    hands.onResults(onResults);
+
+    camera = new Camera(video, {
+      onFrame: async () => {
+        await hands.send({ image: video });
+      },
+      width: 1280,
+      height: 720,
+    });
+
+    try {
+      await camera.start();
+    } catch (e) {
+      setStatus('camera start failed');
+      alert('Nu pot porni camera: ' + e.name + ' — ' + e.message);
+      return;
+    }
+
+    running = true;
+    btnStart.disabled = true;
+    btnStop.disabled = false;
+    btnFlip.disabled = false;
+
+    lastTotals = [];
+    for (const h of perHandHistory) h.length = 0;
+
+    lastT = performance.now();
+    fpsEMA = 0;
+
+    setStatus('running');
+  }
+
+  async function stop(){
+    running = false;
+
+    try { if (camera) camera.stop(); } catch(_) {}
+    camera = null;
+
+    try { if (hands) hands.close(); } catch(_) {}
+    hands = null;
+
+    const s = video.srcObject;
+    if (s && s.getTracks) {
+      try { s.getTracks().forEach(t => t.stop()); } catch(_) {}
+    }
+    video.srcObject = null;
+
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+    btnFlip.disabled = true;
+
+    elHeadline.textContent = '—';
+    elHands.textContent = '0';
+    elTotal.textContent = '0';
+    elFps.textContent = '0';
+    elPerHand.innerHTML = '';
+
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    setStatus('stopped');
+  }
+
+  function onResults(results){
+    // fps
+    const now = performance.now();
+    const dt = now - lastT;
+    lastT = now;
+    const fps = dt > 0 ? 1000/dt : 0;
+    fpsEMA = fpsEMA ? (fpsEMA*0.9 + fps*0.1) : fps;
+    elFps.textContent = fpsEMA.toFixed(1);
+
+    if (!canvas.width || !canvas.height) resizeCanvas();
+
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    drawVideoBase();
+
+    const lms = results.multiHandLandmarks || [];
+    const handed = results.multiHandedness || [];
+
+    const handsInFrame = lms.length;
+    elHands.textContent = String(handsInFrame);
+
+    let perHand = [];
+    let total = 0;
+
+    for (let i=0;i<lms.length;i++){
+      const handLabel = handed[i]?.label || 'Unknown';
+      const fingersRaw = countFingersOneHand(lms[i]);
+      const fingers = smoothHand(i, fingersRaw);
+      total += fingers;
+      perHand.push({ i, handLabel, fingers });
+
+      // draw skeleton
+      drawConnectors(ctx, lms[i], HAND_CONNECTIONS, { color: '#00ffcc', lineWidth: 2 });
+      drawLandmarks(ctx, lms[i], { color: '#ff3344', lineWidth: 1, radius: 3 });
+    }
+
+    const smooth = smoothTotal(total);
+    elTotal.textContent = String(smooth);
+
+    setPerHand(perHand);
+
+    const msg = `Ai in cadru ${handsInFrame} maini si ${smooth} degete ridicate!`;
+    elHeadline.textContent = msg;
+    setStatus(msg);
+
+    drawBanner(msg);
+  }
+
+  btnStart.addEventListener('click', start);
+  btnStop.addEventListener('click', stop);
+  btnFlip.addEventListener('click', () => { flip = !flip; });
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus('getUserMedia NOT supported');
+    alert('Browser-ul tău nu suportă camera via getUserMedia. Încearcă Chrome/Edge modern.');
+  }
+</script>
+</body>
+</html>
