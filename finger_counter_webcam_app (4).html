@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Finger Counter - HTML5</title>
+
+  <!-- TFJS + Handpose (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.16.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose@0.0.7/dist/handpose.min.js"></script>
+
+  <style>
+    :root { --w: 720px; --h: 540px; }
+    body { margin:0; background:#0b0b0f; color:#fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 18px; }
+    h1 { font-size: 18px; margin: 0 0 10px; opacity: .92; }
+    .row { display: grid; grid-template-columns: 1fr; gap: 14px; }
+    @media (min-width: 960px){ .row{ grid-template-columns: 1fr 320px; } }
+
+    .stage { position: relative; width: var(--w); max-width: 100%; aspect-ratio: 4/3; margin: 0 auto; border-radius: 18px; overflow: hidden; border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.04); }
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; }
+
+    .panel { border-radius: 18px; border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.04); padding: 14px; }
+    .btns { display:flex; gap:10px; flex-wrap: wrap; }
+    button { padding: 10px 16px; font-weight: 750; border: 0; border-radius: 14px; cursor: pointer; }
+    .primary { background: #fff; color: #000; }
+    .danger { background: #ff4d4d; color: #000; }
+    .ghost { background: rgba(255,255,255,.10); color: #fff; border: 1px solid rgba(255,255,255,.14); }
+
+    .big { font-size: 54px; font-weight: 900; line-height: 1; margin: 12px 0 6px; }
+    .muted { color: rgba(255,255,255,.70); font-size: 13px; line-height: 1.35; }
+    .kv { display:flex; align-items:center; justify-content:space-between; gap: 10px; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,.08); }
+    .kv:last-child{ border-bottom:0; }
+    .pill { font-size: 12px; padding: 4px 10px; border-radius: 999px; background: rgba(255,255,255,.10); border: 1px solid rgba(255,255,255,.12); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>🖐 Finger Counter (HTML5) — PREVIEW → arată 2/3/4 degete</h1>
+
+    <div class="row">
+      <div class="stage">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="canvas"></canvas>
+      </div>
+
+      <div class="panel">
+        <div class="btns">
+          <button id="btnStart" class="primary">PREVIEW</button>
+          <button id="btnStop" class="danger" disabled>STOP</button>
+          <button id="btnFlip" class="ghost" disabled>FLIP</button>
+        </div>
+
+        <div class="big" id="count">—</div>
+        <div class="muted" id="status">Status: idle</div>
+
+        <div style="height:10px"></div>
+        <div class="kv"><div class="muted">Model</div><div class="pill" id="model">not loaded</div></div>
+        <div class="kv"><div class="muted">FPS</div><div class="pill" id="fps">0</div></div>
+        <div class="kv"><div class="muted">Hand</div><div class="pill" id="hand">—</div></div>
+
+        <div style="height:12px"></div>
+        <div class="muted">
+          Dacă nu pornește camera: în Chrome click pe iconița camerei → Allow. Dacă e folosită de Teams/Zoom, închide-le.
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+
+  const btnStart = document.getElementById('btnStart');
+  const btnStop  = document.getElementById('btnStop');
+  const btnFlip  = document.getElementById('btnFlip');
+
+  const elCount  = document.getElementById('count');
+  const elStatus = document.getElementById('status');
+  const elModel  = document.getElementById('model');
+  const elFps    = document.getElementById('fps');
+  const elHand   = document.getElementById('hand');
+
+  let model = null;
+  let stream = null;
+  let running = false;
+  let rafId = 0;
+  let flip = false;
+
+  // simple smoothing so it doesn't flicker
+  let lastCounts = [];
+  const SMOOTH_N = 6;
+
+  // fps
+  let lastT = 0;
+  let fpsEMA = 0;
+
+  function setStatus(s){ elStatus.textContent = 'Status: ' + s; }
+
+  function resizeCanvasToVideo(){
+    const w = video.videoWidth || 640;
+    const h = video.videoHeight || 480;
+    canvas.width = w;
+    canvas.height = h;
+  }
+
+  async function ensureModel(){
+    if (model) return model;
+    setStatus('loading model…');
+    try {
+      model = await handpose.load();
+      elModel.textContent = 'loaded';
+      setStatus('model ready');
+      return model;
+    } catch (e) {
+      elModel.textContent = 'ERROR';
+      setStatus('model load failed');
+      alert('Model load failed: ' + (e?.message || e));
+      throw e;
+    }
+  }
+
+  async function start(){
+    if (running) return;
+
+    // if previous stream exists, stop it cleanly
+    await stop();
+
+    setStatus('requesting camera…');
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: 'user',
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: false
+      });
+    } catch (e) {
+      setStatus('camera permission denied');
+      alert('Nu pot porni camera: ' + e.name + ' — ' + e.message);
+      return;
+    }
+
+    video.srcObject = stream;
+
+    // wait for metadata
+    await new Promise((resolve) => {
+      video.onloadedmetadata = () => resolve();
+    });
+
+    // Important: play can still fail unless muted or user gesture — we have both.
+    try { await video.play(); } catch (_) {}
+
+    resizeCanvasToVideo();
+
+    await ensureModel();
+
+    running = true;
+    btnStart.disabled = true;
+    btnStop.disabled = false;
+    btnFlip.disabled = false;
+
+    lastCounts = [];
+    elCount.textContent = '0';
+
+    setStatus('running');
+    lastT = performance.now();
+    loop();
+  }
+
+  async function stop(){
+    running = false;
+    cancelAnimationFrame(rafId);
+    rafId = 0;
+
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    if (video) {
+      try { video.pause(); } catch(_){}
+      video.srcObject = null;
+    }
+
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+    btnFlip.disabled = true;
+
+    elHand.textContent = '—';
+    elCount.textContent = '—';
+    setStatus('stopped');
+
+    // clear canvas
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+  }
+
+  function median(arr){
+    if (!arr.length) return 0;
+    const a = arr.slice().sort((x,y)=>x-y);
+    const mid = Math.floor(a.length/2);
+    return a.length % 2 ? a[mid] : Math.round((a[mid-1]+a[mid])/2);
+  }
+
+  function smoothCount(c){
+    lastCounts.push(c);
+    if (lastCounts.length > SMOOTH_N) lastCounts.shift();
+    return median(lastCounts);
+  }
+
+  function countFingers(landmarks){
+    // landmarks: [ [x,y,z], ... ]
+    let count = 0;
+
+    // detect right/left hand from palm: index MCP (5) vs pinky MCP (17)
+    const isRightHand = landmarks[17][0] < landmarks[5][0];
+    elHand.textContent = isRightHand ? 'right' : 'left';
+
+    // thumb: compare tip (4) to IP joint (3) on x-axis; direction depends on handedness
+    if (isRightHand) {
+      if (landmarks[4][0] > landmarks[3][0]) count++;
+    } else {
+      if (landmarks[4][0] < landmarks[3][0]) count++;
+    }
+
+    // other fingers: tip above pip (lower y is higher on image)
+    const tips = [8,12,16,20];
+    const pips = [6,10,14,18];
+    for (let i=0;i<4;i++){
+      if (landmarks[tips[i]][1] < landmarks[pips[i]][1]) count++;
+    }
+    return count;
+  }
+
+  function drawOverlay(count){
+    ctx.save();
+
+    // mirror if flip
+    if (flip) {
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+    }
+
+    // draw video
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    // count badge
+    ctx.globalAlpha = 0.95;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(14, 14, 92, 72);
+    ctx.fillStyle = '#fff';
+    ctx.font = '700 44px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(String(count), 60, 50);
+
+    ctx.restore();
+  }
+
+  function drawLandmarks(landmarks){
+    ctx.save();
+    if (flip) {
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+    }
+
+    ctx.fillStyle = 'rgba(255,0,0,0.95)';
+    for (const p of landmarks){
+      ctx.beginPath();
+      ctx.arc(p[0], p[1], 4.5, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    ctx.restore();
+  }
+
+  async function loop(){
+    if (!running) return;
+
+    const now = performance.now();
+    const dt = now - lastT;
+    lastT = now;
+    const fps = dt > 0 ? 1000/dt : 0;
+    fpsEMA = fpsEMA ? (fpsEMA*0.9 + fps*0.1) : fps;
+    elFps.textContent = fpsEMA.toFixed(1);
+
+    // draw base
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    // estimate
+    let count = 0;
+    try {
+      const preds = await model.estimateHands(video, true);
+      if (preds && preds.length){
+        const lm = preds[0].landmarks;
+        count = countFingers(lm);
+        const s = smoothCount(count);
+        elCount.textContent = String(s);
+        drawOverlay(s);
+        drawLandmarks(lm);
+      } else {
+        elHand.textContent = '—';
+        elCount.textContent = '0';
+        drawOverlay(0);
+      }
+    } catch (e) {
+      // If model errors, show something visible
+      setStatus('runtime error (see console)');
+      console.error(e);
+    }
+
+    rafId = requestAnimationFrame(loop);
+  }
+
+  btnStart.addEventListener('click', start);
+  btnStop.addEventListener('click', stop);
+  btnFlip.addEventListener('click', () => { flip = !flip; });
+
+  // Basic support check
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus('getUserMedia NOT supported');
+    alert('Browser-ul tău nu suportă camera via getUserMedia. Încearcă Chrome/Edge modern.');
+  }
+</script>
+</body>
+</html>
