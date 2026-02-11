@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Multi-Hand Finger Counter - HTML5</title>
+
+  <!-- MediaPipe Hands (multi-hand) via CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <style>
+    :root {
+      --bg: #0b0b0f;
+      --card: rgba(255,255,255,.05);
+      --stroke: rgba(255,255,255,.12);
+      --muted: rgba(255,255,255,.72);
+      --chip: rgba(255,255,255,.08);
+      --chipStroke: rgba(255,255,255,.10);
+    }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:#fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+
+    .wrap { max-width: 1120px; margin: 0 auto; padding: 14px; }
+    h1 { font-size: 14px; margin: 0 0 10px; opacity: .9; }
+
+    .row { display:grid; grid-template-columns: 1fr; gap: 12px; align-items: start; }
+    @media (min-width: 980px){ .row{ grid-template-columns: 1fr 360px; } }
+
+    .stage {
+      position:relative;
+      width: 100%;
+      max-width: 900px;
+      margin: 0 auto;
+      border-radius: 18px;
+      overflow:hidden;
+      border:1px solid var(--stroke);
+      background: var(--card);
+      /* mobile-friendly height */
+      height: min(62vh, 640px);
+    }
+    @media (min-width: 980px){
+      .stage{ height: min(74vh, 720px); }
+    }
+
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; }
+
+    .panel {
+      border-radius: 18px;
+      border: 1px solid var(--stroke);
+      background: var(--card);
+      padding: 12px;
+      position: sticky;
+      top: 12px;
+    }
+
+    .btns { display:flex; gap:10px; flex-wrap: wrap; }
+    button { padding: 10px 14px; font-weight: 850; border: 0; border-radius: 14px; cursor: pointer; }
+    .primary { background:#fff; color:#000; }
+    .danger { background:#ff4d4d; color:#000; }
+    .ghost { background: rgba(255,255,255,.10); color:#fff; border:1px solid rgba(255,255,255,.14); }
+
+    .headline { font-size: 18px; font-weight: 900; line-height: 1.15; margin: 12px 0 6px; letter-spacing: -0.02em; }
+    .muted { color: var(--muted); font-size: 13px; line-height: 1.35; }
+
+    .kv { display:flex; align-items:center; justify-content:space-between; gap:10px; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,.08); }
+    .kv:last-child{ border-bottom:0; }
+    .pill { font-size: 12px; padding: 5px 10px; border-radius: 999px; background: rgba(255,255,255,.10); border: 1px solid rgba(255,255,255,.12); }
+
+    .list { margin-top: 10px; display:flex; flex-direction:column; gap:8px; }
+    .chip { font-size: 12px; padding: 7px 10px; border-radius: 14px; background: var(--chip); border: 1px solid var(--chipStroke); }
+
+    .hint { font-size: 12px; color: rgba(255,255,255,.6); margin-top: 10px; }
+
+    /* Smaller in-canvas banner */
+    .note { font-size: 12px; color: rgba(255,255,255,.6); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>🖐 Multi-Hand Finger Counter — PREVIEW</h1>
+
+    <div class="row">
+      <div class="stage" id="stage">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="canvas"></canvas>
+      </div>
+
+      <div class="panel">
+        <div class="btns">
+          <button id="btnStart" class="primary">PREVIEW</button>
+          <button id="btnStop"  class="danger" disabled>STOP</button>
+          <button id="btnFlip"  class="ghost" disabled>FLIP</button>
+          <button id="btnFs"    class="ghost" disabled>FULLSCREEN</button>
+        </div>
+
+        <div class="headline" id="headline">—</div>
+        <div class="muted" id="status">Status: idle</div>
+
+        <div style="height:10px"></div>
+        <div class="kv"><div class="muted">Hands in frame</div><div class="pill" id="handsInFrame">0</div></div>
+        <div class="kv"><div class="muted">Total fingers up</div><div class="pill" id="totalFingers">0</div></div>
+        <div class="kv"><div class="muted">FPS</div><div class="pill" id="fps">0</div></div>
+
+        <div class="list" id="perHand"></div>
+
+        <div class="hint">Tip: pe telefon, folosește FULLSCREEN pentru vizualizare mai bună.</div>
+        <div class="note">Sunet: pune <b>deget.mp3</b> lângă <b>index.html</b>.</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const stage = document.getElementById('stage');
+
+  const btnStart = document.getElementById('btnStart');
+  const btnStop  = document.getElementById('btnStop');
+  const btnFlip  = document.getElementById('btnFlip');
+  const btnFs    = document.getElementById('btnFs');
+
+  const elHeadline = document.getElementById('headline');
+  const elStatus   = document.getElementById('status');
+  const elHands    = document.getElementById('handsInFrame');
+  const elTotal    = document.getElementById('totalFingers');
+  const elFps      = document.getElementById('fps');
+  const elPerHand  = document.getElementById('perHand');
+
+  let running = false;
+  let flip = false;
+  let camera = null;
+  let hands = null;
+
+  // smoothing
+  let lastTotals = [];
+  const SMOOTH_N = 6;
+  const perHandHistory = Array.from({length: 6}, () => []);
+
+  // fps
+  let lastT = 0;
+  let fpsEMA = 0;
+
+  const MAX_HANDS = 4;
+
+  // Audio: play when total fingers == 1
+  const beep = new Audio('deget.mp3');
+  beep.preload = 'auto';
+  let lastBeepAt = 0;
+  const BEEP_COOLDOWN_MS = 700;
+  let audioUnlocked = false;
+
+  function unlockAudioOnce() {
+    if (audioUnlocked) return;
+    // Mobile needs a user gesture to allow audio.
+    try {
+      beep.volume = 1.0;
+      const p = beep.play();
+      if (p && p.then) {
+        p.then(() => { beep.pause(); beep.currentTime = 0; audioUnlocked = true; })
+         .catch(() => { /* still locked until gesture */ });
+      } else {
+        beep.pause(); beep.currentTime = 0; audioUnlocked = true;
+      }
+    } catch (_) {}
+  }
+
+  function setStatus(s){ elStatus.textContent = 'Status: ' + s; }
+
+  function median(arr){
+    if (!arr.length) return 0;
+    const a = arr.slice().sort((x,y)=>x-y);
+    const mid = Math.floor(a.length/2);
+    return a.length % 2 ? a[mid] : Math.round((a[mid-1]+a[mid])/2);
+  }
+  function smoothTotal(v){
+    lastTotals.push(v);
+    if (lastTotals.length > SMOOTH_N) lastTotals.shift();
+    return median(lastTotals);
+  }
+  function smoothHand(idx, v){
+    const h = perHandHistory[idx] || (perHandHistory[idx] = []);
+    h.push(v);
+    if (h.length > SMOOTH_N) h.shift();
+    return median(h);
+  }
+
+  function resizeCanvas(){
+    const w = video.videoWidth || 640;
+    const h = video.videoHeight || 480;
+    canvas.width = w;
+    canvas.height = h;
+  }
+
+  // Angle-based finger counting
+  function angleDeg(a, b, c) {
+    const abx = a.x - b.x, aby = a.y - b.y;
+    const cbx = c.x - b.x, cby = c.y - b.y;
+    const dot = abx*cbx + aby*cby;
+    const ab = Math.hypot(abx, aby);
+    const cb = Math.hypot(cbx, cby);
+    if (ab === 0 || cb === 0) return 0;
+    let cos = dot / (ab * cb);
+    cos = Math.max(-1, Math.min(1, cos));
+    return Math.acos(cos) * 180 / Math.PI;
+  }
+
+  function fingerExtendedByAngle(lm, mcp, pip, tip) {
+    const ang = angleDeg(lm[mcp], lm[pip], lm[tip]);
+    return ang > 160;
+  }
+
+  function thumbExtendedByAngle(lm) {
+    const a1 = angleDeg(lm[1], lm[2], lm[4]);
+    const a2 = angleDeg(lm[2], lm[3], lm[4]);
+    return (a1 > 150) && (a2 > 150);
+  }
+
+  function countFingersOneHand(lm){
+    let c = 0;
+    if (thumbExtendedByAngle(lm)) c++;
+    if (fingerExtendedByAngle(lm, 5, 6, 8)) c++;
+    if (fingerExtendedByAngle(lm, 9,10,12)) c++;
+    if (fingerExtendedByAngle(lm,13,14,16)) c++;
+    if (fingerExtendedByAngle(lm,17,18,20)) c++;
+
+    // sanity: tip farther from wrist than pip
+    const wrist = lm[0];
+    const pairs = [ [8,6], [12,10], [16,14], [20,18] ];
+    let sane = 0;
+    for (const [tip, pip] of pairs){
+      const dt = Math.hypot(lm[tip].x - wrist.x, lm[tip].y - wrist.y);
+      const dp = Math.hypot(lm[pip].x - wrist.x, lm[pip].y - wrist.y);
+      if (dt > dp) sane++;
+    }
+    if (sane === 0) c = thumbExtendedByAngle(lm) ? 1 : 0;
+
+    return c;
+  }
+
+  function drawVideoBase(){
+    if (flip) {
+      ctx.save();
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      ctx.restore();
+    } else {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    }
+  }
+
+  function drawBanner(text){
+    ctx.save();
+    ctx.globalAlpha = 0.86;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    const pad = 10;
+    const w = Math.min(canvas.width - pad*2, 620);
+    const h = 44;
+    ctx.fillRect(pad, pad, w, h);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = '800 14px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, pad + 10, pad + h/2);
+    ctx.restore();
+  }
+
+  function setPerHand(items){
+    elPerHand.innerHTML = '';
+    items.forEach(it => {
+      const div = document.createElement('div');
+      div.className = 'chip';
+      div.textContent = `Mâna ${it.i+1} (${it.handLabel}): ${it.fingers} degete`;
+      elPerHand.appendChild(div);
+    });
+  }
+
+  async function start(){
+    if (running) return;
+
+    // user gesture: unlock audio on start
+    unlockAudioOnce();
+
+    setStatus('starting…');
+
+    hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+      maxNumHands: MAX_HANDS,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.75,
+      minTrackingConfidence: 0.75,
+    });
+
+    hands.onResults(onResults);
+
+    camera = new Camera(video, {
+      onFrame: async () => {
+        await hands.send({ image: video });
+      },
+      width: 1280,
+      height: 720,
+    });
+
+    try {
+      await camera.start();
+    } catch (e) {
+      setStatus('camera start failed');
+      alert('Nu pot porni camera: ' + e.name + ' — ' + e.message);
+      return;
+    }
+
+    running = true;
+    btnStart.disabled = true;
+    btnStop.disabled = false;
+    btnFlip.disabled = false;
+    btnFs.disabled = false;
+
+    lastTotals = [];
+    for (const h of perHandHistory) h.length = 0;
+
+    lastT = performance.now();
+    fpsEMA = 0;
+
+    setStatus('running');
+  }
+
+  async function stop(){
+    running = false;
+
+    try { if (camera) camera.stop(); } catch(_) {}
+    camera = null;
+
+    try { if (hands) hands.close(); } catch(_) {}
+    hands = null;
+
+    const s = video.srcObject;
+    if (s && s.getTracks) {
+      try { s.getTracks().forEach(t => t.stop()); } catch(_) {}
+    }
+    video.srcObject = null;
+
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+    btnFlip.disabled = true;
+    btnFs.disabled = true;
+
+    elHeadline.textContent = '—';
+    elHands.textContent = '0';
+    elTotal.textContent = '0';
+    elFps.textContent = '0';
+    elPerHand.innerHTML = '';
+
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    setStatus('stopped');
+  }
+
+  function maybeBeep(totalFingers){
+    if (totalFingers !== 1) return;
+    const now = Date.now();
+    if (now - lastBeepAt < BEEP_COOLDOWN_MS) return;
+    lastBeepAt = now;
+
+    // restart sound from beginning
+    try {
+      beep.currentTime = 0;
+      const p = beep.play();
+      if (p && p.catch) p.catch(() => {});
+    } catch (_) {}
+  }
+
+  function onResults(results){
+    // fps
+    const now = performance.now();
+    const dt = now - lastT;
+    lastT = now;
+    const fps = dt > 0 ? 1000/dt : 0;
+    fpsEMA = fpsEMA ? (fpsEMA*0.9 + fps*0.1) : fps;
+    elFps.textContent = fpsEMA.toFixed(1);
+
+    if (!canvas.width || !canvas.height) resizeCanvas();
+
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    drawVideoBase();
+
+    const lms = results.multiHandLandmarks || [];
+    const handed = results.multiHandedness || [];
+
+    const handsInFrame = lms.length;
+    elHands.textContent = String(handsInFrame);
+
+    let perHand = [];
+    let total = 0;
+
+    for (let i=0;i<lms.length;i++){
+      const handLabel = handed[i]?.label || 'Unknown';
+      const fingersRaw = countFingersOneHand(lms[i]);
+      const fingers = smoothHand(i, fingersRaw);
+      total += fingers;
+      perHand.push({ i, handLabel, fingers });
+
+      drawConnectors(ctx, lms[i], HAND_CONNECTIONS, { color: '#00ffcc', lineWidth: 2 });
+      drawLandmarks(ctx, lms[i], { color: '#ff3344', lineWidth: 1, radius: 3 });
+    }
+
+    const smooth = smoothTotal(total);
+    elTotal.textContent = String(smooth);
+
+    setPerHand(perHand);
+
+    const msg = `Ai in cadru ${handsInFrame} maini si ${smooth} degete ridicate!`;
+    elHeadline.textContent = msg;
+    setStatus(msg);
+
+    drawBanner(msg);
+
+    maybeBeep(smooth);
+  }
+
+  async function toggleFullscreen(){
+    // fullscreen the stage (video+canvas)
+    try {
+      if (!document.fullscreenElement) {
+        await stage.requestFullscreen();
+      } else {
+        await document.exitFullscreen();
+      }
+    } catch (_) {
+      // iOS Safari uses webkit fullscreen sometimes; leave it.
+    }
+  }
+
+  btnStart.addEventListener('click', start);
+  btnStop.addEventListener('click', stop);
+  btnFlip.addEventListener('click', () => { flip = !flip; });
+  btnFs.addEventListener('click', toggleFullscreen);
+
+  // Also unlock audio on any first tap/click (mobile)
+  window.addEventListener('pointerdown', unlockAudioOnce, { once: true });
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus('getUserMedia NOT supported');
+    alert('Browser-ul tău nu suportă camera via getUserMedia. Încearcă Chrome/Edge modern.');
+  }
+</script>
+</body>
+</html>
